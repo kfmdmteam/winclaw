@@ -128,7 +128,16 @@ Open **Command Prompt** or **PowerShell** (not Git Bash — the terminal REPL re
 ```bat
 git clone https://github.com/kfmdmteam/winclaw.git
 cd winclaw
+```
+
+**Command Prompt:**
+```bat
 build.bat release
+```
+
+**PowerShell** — prefix with `.\` (PowerShell does not run scripts from the current directory without it):
+```powershell
+.\build.bat release
 ```
 
 The build script:
@@ -221,6 +230,9 @@ This means `SetNamedSecurityInfoW` returned an error when applying ACLs to `%APP
 
 **Garbled output / no colours**
 WinClaw requires a terminal that supports ANSI escape codes. Use Windows Terminal, PowerShell 7+, or Command Prompt on Windows 10 1903+. The legacy `conhost.exe` on older systems may need Virtual Terminal Processing enabled manually.
+
+**`build.bat is not recognized` in PowerShell**
+PowerShell does not run scripts from the current directory by default. Use `.\build.bat` instead of `build.bat`. The same applies to the built binary: `.\winclaw.exe` or `.\winclaw.exe --setup`.
 
 **`build.bat` says `go mod tidy failed`**
 Usually a network issue downloading dependencies. Try:
@@ -339,15 +351,19 @@ If the event source is not yet registered (first run without elevation), all out
 
 ## Build flags
 
+**Command Prompt:**
 ```bat
-:: Debug build — includes symbols, faster iteration
-build.bat
-
-:: Release build — stripped binary, smaller file
-build.bat release
+build.bat           :: debug
+build.bat release   :: stripped, smaller
 ```
 
-Manual build:
+**PowerShell:**
+```powershell
+.\build.bat           # debug
+.\build.bat release   # stripped, smaller
+```
+
+Manual build (either shell):
 ```bat
 go build -tags windows -ldflags="-s -w" -o winclaw.exe ./cmd/winclaw
 ```
