@@ -1,0 +1,31 @@
+# Build output
+winclaw.exe
+*.exe
+
+# Go
+go.sum
+
+# Data / secrets (never commit)
+*.env
+.env*
+*.db
+*.db-shm
+*.db-wal
+
+# Config with potential secrets
+config.json
+
+# Session data
+sessions/
+
+# Temp files
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+Thumbs.db
+desktop.ini
