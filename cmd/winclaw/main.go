@@ -14,8 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/term"
-
 	"winclaw/internal/agent"
 	"winclaw/internal/api"
 	"winclaw/internal/config"
@@ -202,10 +200,14 @@ func runSetup(cfg *config.Config) {
 	fmt.Println("=== WinClaw Setup ===")
 	fmt.Println()
 
-	// Prompt for the API key with echo disabled.
-	fmt.Print("Enter your Anthropic API key: ")
-	apiKey, err := readPassword()
-	fmt.Println() // newline after masked input
+	// Prompt for the API key.
+	// Input is visible so that paste works reliably across all Windows
+	// terminals. The key goes directly to Credential Manager and is never
+	// written to disk.
+	fmt.Println("Paste or type your Anthropic API key, then press Enter.")
+	fmt.Println("(Input is visible in your terminal but is never saved to disk.)")
+	fmt.Print("> ")
+	apiKey, err := readLine()
 	if err != nil {
 		fatalf("read API key: %v", err)
 	}
@@ -238,15 +240,30 @@ func runSetup(cfg *config.Config) {
 	fmt.Println("Setup complete. Run winclaw to start.")
 }
 
-// readPassword reads a password from stdin with echo disabled.
-// Uses golang.org/x/term which handles typed input and paste correctly
-// across Command Prompt, PowerShell, and Windows Terminal.
-func readPassword() (string, error) {
-	b, err := term.ReadPassword(int(os.Stdin.Fd()))
-	if err != nil {
-		return "", fmt.Errorf("read password: %w", err)
+// readLine reads a single line from stdin, trimming CR/LF.
+// Plain line reading works reliably for paste across all Windows terminals.
+func readLine() (string, error) {
+	var line strings.Builder
+	buf := make([]byte, 1)
+	for {
+		n, err := os.Stdin.Read(buf)
+		if n > 0 {
+			c := buf[0]
+			if c == '\n' {
+				break
+			}
+			if c != '\r' {
+				line.WriteByte(c)
+			}
+		}
+		if err != nil {
+			if line.Len() > 0 {
+				break // EOF after partial input is fine
+			}
+			return "", fmt.Errorf("read input: %w", err)
+		}
 	}
-	return strings.TrimRight(string(b), "\r\n"), nil
+	return strings.TrimSpace(line.String()), nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
