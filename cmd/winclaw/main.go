@@ -47,9 +47,6 @@ func main() {
 		os.Exit(0)
 	}
 
-	// ── Banner ───────────────────────────────────────────────────────────────
-	fmt.Printf("WinClaw %s — Windows-Native Terminal AI Assistant\n", version)
-
 	// ── Load config ──────────────────────────────────────────────────────────
 	cfg, err := config.Load()
 	if err != nil {
@@ -201,7 +198,7 @@ func main() {
 			func(content string) error { return memMgr.WriteSoul(content) },
 		)
 	}
-	repl := terminal.NewREPL(cfg, sess, ag, sessionMgr, memMgr, sched, noColor, toolsMaker)
+	repl := terminal.NewREPL(cfg, sess, ag, sessionMgr, memMgr, sched, noColor, toolsMaker, version)
 
 	if runErr := repl.Run(rootCtx); runErr != nil {
 		// Non-zero exit for unexpected errors; EOF / user exit is normal.

@@ -126,7 +126,7 @@ func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 				continue
 			}
 			if a.onOutput != nil {
-				a.onOutput(fmt.Sprintf("\n[%s]\n", block.Name))
+				a.onOutput("\x00TOOL\x00" + block.Name)
 			}
 			output, execErr := a.Tools.Execute(ctx, block.Name, block.Input)
 			isError := false

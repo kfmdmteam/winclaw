@@ -31,19 +31,24 @@ const (
 	ansiBold     = "\x1b[1m"
 	ansiDim      = "\x1b[2m"
 	ansiFgCyan   = "\x1b[36m"
+	ansiFgBCyan  = "\x1b[96m"
 	ansiFgGreen  = "\x1b[92m"
 	ansiFgYellow = "\x1b[33m"
 	ansiFgRed    = "\x1b[91m"
 	ansiFgWhite  = "\x1b[97m"
 	ansiFgGray   = "\x1b[90m"
+	ansiFgPurple = "\x1b[95m"
 
 	// Compound codes used in the REPL.
-	colorPrompt  = ansiBold + ansiFgCyan
+	colorPrompt  = ansiBold + ansiFgBCyan
 	colorInput   = ansiFgWhite
 	colorOutput  = ansiFgGreen
 	colorCommand = ansiFgYellow
 	colorError   = ansiBold + ansiFgRed
 	colorSystem  = ansiDim + ansiFgGray
+	colorTool    = ansiBold + ansiFgPurple
+	colorBanner  = ansiBold + ansiFgBCyan
+	colorMeta    = ansiDim + ansiFgCyan
 )
 
 // enableVirtualTerminal requests ENABLE_VIRTUAL_TERMINAL_PROCESSING on the
@@ -76,6 +81,7 @@ type REPL struct {
 	memory     *memory.MemoryManager
 	scheduler  *scheduler.Scheduler
 	toolsMaker func(sess *agent.Session) *tools.Registry
+	version    string
 
 	history    []string
 	historyIdx int // points one past the last item (insertion point)
@@ -104,6 +110,7 @@ func NewREPL(
 	sched *scheduler.Scheduler,
 	noColor bool,
 	toolsMaker func(sess *agent.Session) *tools.Registry,
+	version string,
 ) *REPL {
 	ansiOK := enableVirtualTerminal()
 	return &REPL{
@@ -116,6 +123,7 @@ func NewREPL(
 		ansiOK:     ansiOK,
 		noColor:    noColor,
 		toolsMaker: toolsMaker,
+		version:    version,
 	}
 }
 
@@ -130,7 +138,7 @@ func (r *REPL) Run(ctx context.Context) error {
 	}
 	defer term.Restore(fd, oldState)
 
-	r.printSystem("WinClaw v0.1.0 — type /help for commands, Ctrl+D to exit.\r\n")
+	r.printBanner()
 
 	for {
 		select {
@@ -397,6 +405,33 @@ func editorFromString(s string) *lineEditor {
 // Terminal rendering
 // ─────────────────────────────────────────────────────────────────────────────
 
+// printBanner renders the startup banner after the terminal enters raw mode.
+func (r *REPL) printBanner() {
+	sessionName := "default"
+	if r.session != nil {
+		sessionName = r.session.Name
+	}
+	ver := r.version
+	if ver == "" {
+		ver = "v0.1.0"
+	}
+
+	box := "  ╭──────────────────────────────────────────╮\r\n"
+	box += "  │                                          │\r\n"
+	box += fmt.Sprintf("  │   %-38s│\r\n", "WinClaw "+ver)
+	box += "  │   Windows-Native Terminal AI Assistant  │\r\n"
+	box += "  │                                          │\r\n"
+	box += "  ╰──────────────────────────────────────────╯\r\n"
+
+	r.print("\r\n")
+	r.print(r.colour(colorBanner, box))
+	r.print(r.colour(colorMeta, fmt.Sprintf("  model   · %s\r\n", r.cfg.Model)))
+	r.print(r.colour(colorMeta, fmt.Sprintf("  session · %s\r\n", sessionName)))
+	r.print("\r\n")
+	r.print(r.colour(colorSystem, "  /help for commands · Ctrl+D to exit\r\n"))
+	r.print("\r\n")
+}
+
 // drawPrompt writes the full prompt and positions the cursor correctly.
 func (r *REPL) drawPrompt(ed *lineEditor) {
 	prompt := r.promptString()
@@ -418,7 +453,7 @@ func (r *REPL) redrawLine(ed *lineEditor) {
 }
 
 func (r *REPL) drawContinuationPrompt() {
-	r.print("\r" + clearEOL() + r.colour(colorPrompt, "... "))
+	r.print("\r" + clearEOL() + r.colour(colorSystem, "      ↳ "))
 }
 
 // promptString returns the formatted prompt text.
@@ -427,7 +462,7 @@ func (r *REPL) promptString() string {
 	if r.session != nil {
 		name = r.session.Name
 	}
-	return r.colour(colorPrompt, fmt.Sprintf("winclaw[%s]> ", name))
+	return r.colour(colorPrompt, fmt.Sprintf("[%s] ❯ ", name))
 }
 
 func clearEOL() string { return "\x1b[K" }
@@ -536,7 +571,8 @@ func (r *REPL) runAgent(ctx context.Context, input string) {
 	}
 
 	// Wire streaming output: each delta stops the spinner on first call,
-	// then writes the chunk directly.
+	// then writes the chunk directly. Tool-use markers (prefixed \x00TOOL\x00)
+	// are rendered in a distinct colour with a visual indicator.
 	r.agentObj = agent.NewAgent(
 		r.session,
 		r.agentObj.Client,
@@ -546,7 +582,12 @@ func (r *REPL) runAgent(ctx context.Context, input string) {
 		func(chunk string) {
 			ensureSpinnerStopped()
 			r.outputMu.Lock()
-			fmt.Fprint(os.Stdout, r.colour(colorOutput, chunk))
+			if strings.HasPrefix(chunk, "\x00TOOL\x00") {
+				name := strings.TrimPrefix(chunk, "\x00TOOL\x00")
+				fmt.Fprint(os.Stdout, "\r\n"+r.colour(colorTool, "  ▸ "+name)+"\r\n")
+			} else {
+				fmt.Fprint(os.Stdout, r.colour(colorOutput, chunk))
+			}
 			r.outputMu.Unlock()
 		},
 	)
