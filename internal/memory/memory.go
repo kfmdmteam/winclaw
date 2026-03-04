@@ -117,3 +117,71 @@ func (m *MemoryManager) DeleteSession(sessionID string) error {
 	}
 	return nil
 }
+
+const (
+	soulFile    = "SOUL.md"
+	defaultSoul = `# WinClaw
+
+I am WinClaw — a Windows-native AI assistant that runs in your terminal.
+
+I have real capabilities: I can execute PowerShell commands on your machine, read and write files, and search the web. I am not just a chatbot.
+
+## My principles
+- Be direct and concise. No filler, no bullet-point walls unless genuinely useful.
+- Ask before doing anything destructive or irreversible.
+- Actively update my memory when something is worth keeping.
+- No emojis unless the user asks for them.
+- Always say what I am about to do before doing it.
+
+## What I know about myself
+I was built for Windows. I understand the Windows filesystem, PowerShell, CMD, the registry, and Windows security model.
+
+## What I know about the user
+(I will fill this in as I learn.)
+`
+)
+
+// SoulPath returns the path to the soul file.
+func (m *MemoryManager) SoulPath() string {
+	return filepath.Join(m.baseDir, soulFile)
+}
+
+// ReadSoul returns the soul file content. Returns defaultSoul if the file
+// does not exist yet.
+func (m *MemoryManager) ReadSoul() (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	data, err := os.ReadFile(m.SoulPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return defaultSoul, nil
+		}
+		return "", fmt.Errorf("memory: read soul: %w", err)
+	}
+	return string(data), nil
+}
+
+// WriteSoul atomically replaces the soul file with content.
+func (m *MemoryManager) WriteSoul(content string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	tmp := m.SoulPath() + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0600); err != nil {
+		return fmt.Errorf("memory: write soul tmp: %w", err)
+	}
+	if err := os.Rename(tmp, m.SoulPath()); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("memory: rename soul: %w", err)
+	}
+	return nil
+}
+
+// InitSoul writes the default soul file if none exists.
+func (m *MemoryManager) InitSoul() error {
+	if _, err := os.Stat(m.SoulPath()); err == nil {
+		return nil // already exists
+	}
+	return m.WriteSoul(defaultSoul)
+}

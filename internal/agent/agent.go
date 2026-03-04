@@ -9,31 +9,33 @@ import (
 	"winclaw/internal/api"
 	"winclaw/internal/config"
 	"winclaw/internal/memory"
+	"winclaw/internal/tools"
 )
 
-const defaultMaxTurns = 20
+const (
+	defaultMaxTurns    = 20
+	defaultMaxToolLoop = 10 // max tool-call iterations per user turn
+)
 
 // Agent drives a single session's conversation with the Anthropic API.
-// It maintains the in-memory message history for the active session and
-// streams assistant tokens to the terminal via the onOutput callback.
 type Agent struct {
 	Session    *Session
 	Client     *api.Client
 	Memory     *memory.MemoryManager
 	Config     *config.Config
+	Tools      *tools.Registry
 	MaxTurns   int
-	TokensUsed int // running total of tokens charged this session
+	TokensUsed int
 	onOutput   func(text string)
 }
 
-// NewAgent constructs an Agent for the given session.
-// onOutput is called with each streamed text chunk as it arrives; it may be nil
-// if the caller does not need streaming output.
+// NewAgent constructs an Agent. onOutput may be nil.
 func NewAgent(
 	sess *Session,
 	client *api.Client,
 	mem *memory.MemoryManager,
 	cfg *config.Config,
+	tl *tools.Registry,
 	onOutput func(string),
 ) *Agent {
 	return &Agent{
@@ -41,29 +43,23 @@ func NewAgent(
 		Client:   client,
 		Memory:   mem,
 		Config:   cfg,
+		Tools:    tl,
 		MaxTurns: defaultMaxTurns,
 		onOutput: onOutput,
 	}
 }
 
-// Run processes a single user input, appending it to the session history,
-// calling the API, and returning the full assistant response text.
-//
-// Token efficiency measures applied on every call:
-//   - Input is trimmed of leading/trailing whitespace.
-//   - Only the most recent HistoryWindow turns are sent to the API; older
-//     messages are retained in Session.Messages for auditing but excluded
-//     from the wire payload.
-//   - The system prompt is compact: date only (not session ID).
+// Run processes a single user input through the agentic loop:
+//  1. Send messages + tools to the API.
+//  2. If the model calls tools, execute them and send results back.
+//  3. Repeat until stop_reason is "end_turn" or the tool loop limit is hit.
 func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 	userInput = strings.TrimSpace(userInput)
 	if userInput == "" {
 		return "", fmt.Errorf("agent: empty input")
 	}
-
 	if len(a.Session.Messages) >= a.MaxTurns*2 {
-		return "", fmt.Errorf("agent: session %q has reached the maximum of %d turns",
-			a.Session.ID, a.MaxTurns)
+		return "", fmt.Errorf("agent: session has reached the maximum of %d turns", a.MaxTurns)
 	}
 
 	systemPrompt, err := a.buildSystemPrompt()
@@ -71,69 +67,104 @@ func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 		return "", fmt.Errorf("agent: build system prompt: %w", err)
 	}
 
+	// Append the user turn.
 	a.Session.Messages = append(a.Session.Messages, api.Message{
 		Role:    "user",
 		Content: userInput,
 	})
 
-	req := api.MessagesRequest{
-		Model:     a.Config.Model,
-		MaxTokens: a.Config.MaxTokens,
-		System:    systemPrompt,
-		Messages:  a.windowedHistory(),
-		Stream:    true,
-	}
+	var finalText string
 
-	var buf strings.Builder
-	onDelta := func(text string) {
-		buf.WriteString(text)
-		if a.onOutput != nil {
-			a.onOutput(text)
+	for iteration := 0; iteration < defaultMaxToolLoop; iteration++ {
+		req := api.MessagesRequest{
+			Model:     a.Config.Model,
+			MaxTokens: a.Config.MaxTokens,
+			System:    systemPrompt,
+			Messages:  a.windowedHistory(),
+			Stream:    true,
+			Tools:     a.Tools.Definitions(),
 		}
-	}
 
-	resp, err := a.Client.StreamMessage(ctx, req, onDelta)
-	if err != nil {
-		a.Session.Messages = a.Session.Messages[:len(a.Session.Messages)-1]
-		return "", fmt.Errorf("agent: stream message: %w", err)
-	}
-
-	fullText := buf.String()
-	if fullText == "" && len(resp.Content) > 0 {
-		for _, block := range resp.Content {
-			if block.Type == "text" {
-				fullText += block.Text
+		var textBuf strings.Builder
+		onDelta := func(text string) {
+			textBuf.WriteString(text)
+			if a.onOutput != nil {
+				a.onOutput(text)
 			}
 		}
+
+		resp, err := a.Client.StreamMessage(ctx, req, onDelta)
+		if err != nil {
+			// Roll back the user message on first iteration only.
+			if iteration == 0 {
+				a.Session.Messages = a.Session.Messages[:len(a.Session.Messages)-1]
+			}
+			return "", fmt.Errorf("agent: api call: %w", err)
+		}
+
+		a.TokensUsed += resp.Usage.InputTokens + resp.Usage.OutputTokens
+
+		// Record what came back as text so far.
+		if textBuf.Len() > 0 {
+			finalText = textBuf.String()
+		}
+
+		// Add the assistant's full response (may include tool_use blocks) to history.
+		a.Session.Messages = append(a.Session.Messages, api.Message{
+			Role:    "assistant",
+			Content: resp.Content,
+		})
+
+		if resp.StopReason != "tool_use" {
+			break
+		}
+
+		// Execute tool calls and collect results.
+		var results []api.ContentBlock
+		for _, block := range resp.Content {
+			if block.Type != "tool_use" {
+				continue
+			}
+			if a.onOutput != nil {
+				a.onOutput(fmt.Sprintf("\n[%s]\n", block.Name))
+			}
+			output, execErr := a.Tools.Execute(ctx, block.Name, block.Input)
+			isError := false
+			if execErr != nil {
+				output = execErr.Error()
+				isError = true
+			}
+			results = append(results, api.ContentBlock{
+				Type:      "tool_result",
+				ToolUseID: block.ID,
+				Content:   output,
+				IsError:   isError,
+			})
+		}
+
+		// Send tool results back as a user turn.
+		a.Session.Messages = append(a.Session.Messages, api.Message{
+			Role:    "user",
+			Content: results,
+		})
 	}
 
-	a.Session.Messages = append(a.Session.Messages, api.Message{
-		Role:    "assistant",
-		Content: fullText,
-	})
-
-	a.TokensUsed += resp.Usage.InputTokens + resp.Usage.OutputTokens
-
-	return fullText, nil
+	return finalText, nil
 }
 
-// Reset clears the in-memory conversation history for the current session.
-// The database audit log, token counter, and memory file on disk are untouched.
+// Reset clears in-memory conversation history. DB and memory files untouched.
 func (a *Agent) Reset() {
 	a.Session.Messages = []api.Message{}
 }
 
-// windowedHistory returns at most 2*HistoryWindow messages (the most recent
-// HistoryWindow turns) from the full session history. This is the payload sent
-// to the API; the full slice is kept for audit purposes.
+// windowedHistory returns at most 2*HistoryWindow messages from the tail of
+// the full history. Always starts on a user message.
 func (a *Agent) windowedHistory() []api.Message {
 	msgs := a.Session.Messages
-	limit := a.Config.HistoryWindow * 2 // pairs → individual messages
+	limit := a.Config.HistoryWindow * 2
 	if len(msgs) <= limit {
 		return msgs
 	}
-	// Always start on a user message so the conversation is well-formed.
-	// Drop from the front in pairs.
 	drop := len(msgs) - limit
 	if drop%2 != 0 {
 		drop++
@@ -141,26 +172,28 @@ func (a *Agent) windowedHistory() []api.Message {
 	return msgs[drop:]
 }
 
-// buildSystemPrompt constructs the system prompt sent to the model.
-//
-// Token budget: the prompt is intentionally short. The session ID is omitted
-// (it is meaningful to the host but wastes tokens for the model). Only the
-// date is included so the model can give time-aware answers. Memory content,
-// when present, is appended verbatim — keep MEMORY.md concise to save tokens.
+// buildSystemPrompt builds the system prompt:
+//  1. Soul file (persistent identity)
+//  2. Current date
+//  3. Session memory (MEMORY.md) if non-empty
 func (a *Agent) buildSystemPrompt() (string, error) {
+	soul, err := a.Memory.ReadSoul()
+	if err != nil {
+		return "", fmt.Errorf("agent: read soul: %w", err)
+	}
+
 	var sb strings.Builder
+	sb.WriteString(strings.TrimSpace(soul))
+	sb.WriteString("\n\n")
+	sb.WriteString("Current date: " + time.Now().UTC().Format("2006-01-02") + ".")
 
-	sb.WriteString("You are WinClaw, a secure Windows terminal AI assistant. ")
-	sb.WriteString(time.Now().UTC().Format("2006-01-02") + ".")
-
-	memContent, err := a.Memory.Read(a.Session.ID)
+	mem, err := a.Memory.Read(a.Session.ID)
 	if err != nil {
 		return "", fmt.Errorf("agent: read memory: %w", err)
 	}
-	trimmed := strings.TrimSpace(memContent)
-	if trimmed != "" {
-		sb.WriteString("\n\n")
-		sb.WriteString(trimmed)
+	if strings.TrimSpace(mem) != "" {
+		sb.WriteString("\n\n## Session Memory\n\n")
+		sb.WriteString(strings.TrimSpace(mem))
 	}
 
 	return sb.String(), nil

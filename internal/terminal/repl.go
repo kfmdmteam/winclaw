@@ -19,6 +19,7 @@ import (
 	"winclaw/internal/config"
 	"winclaw/internal/memory"
 	"winclaw/internal/scheduler"
+	"winclaw/internal/tools"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,6 +75,7 @@ type REPL struct {
 	sessionMgr *agent.SessionManager
 	memory     *memory.MemoryManager
 	scheduler  *scheduler.Scheduler
+	toolsMaker func(sess *agent.Session) *tools.Registry
 
 	history    []string
 	historyIdx int // points one past the last item (insertion point)
@@ -90,6 +92,9 @@ type REPL struct {
 }
 
 // NewREPL constructs a REPL wired to the given dependencies.
+// toolsMaker is called whenever a new agent needs to be constructed for a
+// session (initial start, /new, /switch). It receives the target session and
+// returns a freshly-bound tools.Registry for that session.
 func NewREPL(
 	cfg *config.Config,
 	sess *agent.Session,
@@ -98,6 +103,7 @@ func NewREPL(
 	mem *memory.MemoryManager,
 	sched *scheduler.Scheduler,
 	noColor bool,
+	toolsMaker func(sess *agent.Session) *tools.Registry,
 ) *REPL {
 	ansiOK := enableVirtualTerminal()
 	return &REPL{
@@ -109,6 +115,7 @@ func NewREPL(
 		scheduler:  sched,
 		ansiOK:     ansiOK,
 		noColor:    noColor,
+		toolsMaker: toolsMaker,
 	}
 }
 
@@ -535,6 +542,7 @@ func (r *REPL) runAgent(ctx context.Context, input string) {
 		r.agentObj.Client,
 		r.memory,
 		r.cfg,
+		r.toolsMaker(r.session),
 		func(chunk string) {
 			ensureSpinnerStopped()
 			r.outputMu.Lock()
@@ -674,7 +682,7 @@ func (r *REPL) cmdNew(ctx context.Context, name string) {
 		return
 	}
 	r.session = sess
-	r.agentObj = agent.NewAgent(sess, r.agentObj.Client, r.memory, r.cfg, nil)
+	r.agentObj = agent.NewAgent(sess, r.agentObj.Client, r.memory, r.cfg, r.toolsMaker(sess), nil)
 	r.printSystem(fmt.Sprintf("switched to new session %q (%s)\r\n", sess.Name, sess.ID))
 }
 
@@ -723,7 +731,7 @@ func (r *REPL) cmdSwitch(ctx context.Context, idOrName string) {
 	}
 
 	r.session = target
-	r.agentObj = agent.NewAgent(target, r.agentObj.Client, r.memory, r.cfg, nil)
+	r.agentObj = agent.NewAgent(target, r.agentObj.Client, r.memory, r.cfg, r.toolsMaker(target), nil)
 	r.printSystem(fmt.Sprintf("switched to session %q (%s)\r\n", target.Name, target.ID))
 }
 

@@ -23,6 +23,7 @@ import (
 	"winclaw/internal/scheduler"
 	"winclaw/internal/security"
 	"winclaw/internal/terminal"
+	"winclaw/internal/tools"
 )
 
 const (
@@ -120,6 +121,11 @@ func main() {
 		fatalf("create memory manager: %v", err)
 	}
 
+	// ── Soul file ─────────────────────────────────────────────────────────────
+	if err := memMgr.InitSoul(); err != nil {
+		fatalf("init soul file: %v", err)
+	}
+
 	// ── Session manager ───────────────────────────────────────────────────────
 	sessionMgr := agent.NewSessionManager(database.Conn(), memMgr)
 
@@ -150,8 +156,14 @@ func main() {
 	apiClient := api.NewClient(apiKey, cfg.Model)
 	defer apiClient.Close() // zeros the key from heap memory on exit
 
+	// ── Tools ─────────────────────────────────────────────────────────────────
+	toolRegistry := tools.NewRegistry(
+		func(content string) error { return memMgr.Append(sess.ID, content) },
+		func(content string) error { return memMgr.WriteSoul(content) },
+	)
+
 	// ── Agent ─────────────────────────────────────────────────────────────────
-	ag := agent.NewAgent(sess, apiClient, memMgr, cfg, nil)
+	ag := agent.NewAgent(sess, apiClient, memMgr, cfg, toolRegistry, nil)
 
 	// ── Scheduler ────────────────────────────────────────────────────────────
 	sched := scheduler.NewScheduler(database.Conn(), func(ctx context.Context, sessionID, prompt string) error {
@@ -159,7 +171,11 @@ func main() {
 		if loadErr != nil {
 			return fmt.Errorf("scheduler: load session %q: %w", sessionID, loadErr)
 		}
-		scheduledAgent := agent.NewAgent(scheduledSess, apiClient, memMgr, cfg, nil)
+		schedTools := tools.NewRegistry(
+			func(content string) error { return memMgr.Append(scheduledSess.ID, content) },
+			func(content string) error { return memMgr.WriteSoul(content) },
+		)
+		scheduledAgent := agent.NewAgent(scheduledSess, apiClient, memMgr, cfg, schedTools, nil)
 		_, runErr := scheduledAgent.Run(ctx, prompt)
 		return runErr
 	})
@@ -179,7 +195,13 @@ func main() {
 	go sched.Start(rootCtx)
 
 	// ── REPL ──────────────────────────────────────────────────────────────────
-	repl := terminal.NewREPL(cfg, sess, ag, sessionMgr, memMgr, sched, noColor)
+	toolsMaker := func(s *agent.Session) *tools.Registry {
+		return tools.NewRegistry(
+			func(content string) error { return memMgr.Append(s.ID, content) },
+			func(content string) error { return memMgr.WriteSoul(content) },
+		)
+	}
+	repl := terminal.NewREPL(cfg, sess, ag, sessionMgr, memMgr, sched, noColor, toolsMaker)
 
 	if runErr := repl.Run(rootCtx); runErr != nil {
 		// Non-zero exit for unexpected errors; EOF / user exit is normal.

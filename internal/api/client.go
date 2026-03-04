@@ -154,19 +154,26 @@ func (c *Client) doRequest(ctx context.Context, body []byte) (*http.Response, er
 	return resp, nil
 }
 
-// readStream consumes an SSE stream, firing onDelta for each text delta.
-// It builds and returns a synthetic MessagesResponse from the stream events.
+// readStream consumes an SSE stream. It fires onDelta for text deltas and
+// accumulates tool_use blocks (collecting their JSON input from
+// input_json_delta events). Returns the full response when the stream ends.
 func (c *Client) readStream(ctx context.Context, r io.Reader, onDelta func(text string)) (*MessagesResponse, error) {
+	type blockState struct {
+		block   ContentBlock
+		jsonBuf strings.Builder
+	}
+
 	var (
-		result      MessagesResponse
-		fullText    strings.Builder
-		inputTokens int
+		result       MessagesResponse
+		blocks       = map[int]*blockState{}
+		inputTokens  int
 		outputTokens int
 	)
 
 	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
 	for scanner.Scan() {
-		// Respect context cancellation between lines.
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -177,7 +184,6 @@ func (c *Client) readStream(ctx context.Context, r io.Reader, onDelta func(text 
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
-
 		data := strings.TrimPrefix(line, "data: ")
 		if data == "[DONE]" {
 			break
@@ -185,7 +191,6 @@ func (c *Client) readStream(ctx context.Context, r io.Reader, onDelta func(text 
 
 		var event StreamEvent
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
-			// Skip malformed events rather than aborting.
 			continue
 		}
 
@@ -195,16 +200,34 @@ func (c *Client) readStream(ctx context.Context, r io.Reader, onDelta func(text 
 				result.ID = event.Message.ID
 				result.Model = event.Message.Model
 				result.Role = event.Message.Role
-				result.Type = event.Message.Type
 				inputTokens = event.Message.Usage.InputTokens
 			}
 
+		case "content_block_start":
+			if event.ContentBlock != nil {
+				bs := &blockState{block: *event.ContentBlock}
+				blocks[event.Index] = bs
+			}
+
 		case "content_block_delta":
-			if event.Delta != nil && event.Delta.Type == "text_delta" {
-				text := event.Delta.Text
-				fullText.WriteString(text)
+			bs := blocks[event.Index]
+			if bs == nil || event.Delta == nil {
+				continue
+			}
+			switch event.Delta.Type {
+			case "text_delta":
+				bs.block.Text += event.Delta.Text
 				if onDelta != nil {
-					onDelta(text)
+					onDelta(event.Delta.Text)
+				}
+			case "input_json_delta":
+				bs.jsonBuf.WriteString(event.Delta.PartialJSON)
+			}
+
+		case "content_block_stop":
+			if bs, ok := blocks[event.Index]; ok {
+				if bs.block.Type == "tool_use" && bs.jsonBuf.Len() > 0 {
+					bs.block.Input = json.RawMessage(bs.jsonBuf.String())
 				}
 			}
 
@@ -212,19 +235,12 @@ func (c *Client) readStream(ctx context.Context, r io.Reader, onDelta func(text 
 			if event.Delta != nil && event.Delta.StopReason != "" {
 				result.StopReason = event.Delta.StopReason
 			}
-
-		case "message_stop":
-			// Stream is complete; usage totals arrive in message_delta.
+			if event.Message != nil && event.Message.Usage.OutputTokens > 0 {
+				outputTokens = event.Message.Usage.OutputTokens
+			}
 
 		case "ping":
-			// Keepalive, ignore.
-		}
-
-		// Accumulate output token count from message_delta usage if present.
-		// The Anthropic streaming protocol sends usage in a separate field on
-		// message_delta events; we capture it via the raw event's message field.
-		if event.Message != nil && event.Message.Usage.OutputTokens > 0 {
-			outputTokens = event.Message.Usage.OutputTokens
+			// keepalive, ignore
 		}
 	}
 
@@ -232,7 +248,13 @@ func (c *Client) readStream(ctx context.Context, r io.Reader, onDelta func(text 
 		return nil, fmt.Errorf("api: read stream: %w", err)
 	}
 
-	result.Content = []ContentBlock{{Type: "text", Text: fullText.String()}}
+	// Assemble blocks in index order.
+	for i := 0; i < len(blocks); i++ {
+		if bs, ok := blocks[i]; ok {
+			result.Content = append(result.Content, bs.block)
+		}
+	}
+
 	result.Usage = Usage{InputTokens: inputTokens, OutputTokens: outputTokens}
 	return &result, nil
 }
