@@ -61,9 +61,11 @@ echo.
 echo Build successful: winclaw.exe
 echo.
 echo First-time setup:
-echo   winclaw.exe --setup
+echo   .\winclaw.exe --setup      (PowerShell)
+echo   winclaw.exe --setup        (Command Prompt)
 echo.
 echo Start WinClaw:
-echo   winclaw.exe
+echo   .\winclaw.exe              (PowerShell)
+echo   winclaw.exe                (Command Prompt)
 
 endlocal
