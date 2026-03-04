@@ -11,10 +11,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"time"
-	"unsafe"
 
-	"golang.org/x/sys/windows"
+	"golang.org/x/term"
 
 	"winclaw/internal/agent"
 	"winclaw/internal/api"
@@ -204,7 +204,7 @@ func runSetup(cfg *config.Config) {
 
 	// Prompt for the API key with echo disabled.
 	fmt.Print("Enter your Anthropic API key: ")
-	apiKey, err := readPasswordWindows()
+	apiKey, err := readPassword()
 	fmt.Println() // newline after masked input
 	if err != nil {
 		fatalf("read API key: %v", err)
@@ -238,75 +238,16 @@ func runSetup(cfg *config.Config) {
 	fmt.Println("Setup complete. Run winclaw to start.")
 }
 
-// readPasswordWindows reads a password from the Windows console with echo
-// disabled using ReadConsoleW with ENABLE_ECHO_INPUT cleared.
-func readPasswordWindows() (string, error) {
-	handle := windows.Handle(os.Stdin.Fd())
-
-	var oldMode uint32
-	if err := windows.GetConsoleMode(handle, &oldMode); err != nil {
-		// Fallback: read from stdin without masking (e.g., piped input).
-		var buf [512]byte
-		n, err := os.Stdin.Read(buf[:])
-		if err != nil {
-			return "", err
-		}
-		s := string(buf[:n])
-		// Trim trailing newline / carriage return.
-		for len(s) > 0 && (s[len(s)-1] == '\r' || s[len(s)-1] == '\n') {
-			s = s[:len(s)-1]
-		}
-		return s, nil
+// readPassword reads a password from stdin with echo disabled.
+// Uses golang.org/x/term which handles typed input and paste correctly
+// across Command Prompt, PowerShell, and Windows Terminal.
+func readPassword() (string, error) {
+	b, err := term.ReadPassword(int(os.Stdin.Fd()))
+	if err != nil {
+		return "", fmt.Errorf("read password: %w", err)
 	}
-
-	// Disable echo while reading.
-	const enableEchoInput = 0x0004
-	noEcho := oldMode &^ enableEchoInput
-	if err := windows.SetConsoleMode(handle, noEcho); err != nil {
-		return "", fmt.Errorf("SetConsoleMode (disable echo): %w", err)
-	}
-	defer windows.SetConsoleMode(handle, oldMode)
-
-	// Read characters one at a time via ReadConsoleW until CR or LF.
-	var result []uint16
-	for {
-		var (
-			buf       [2]uint16
-			charsRead uint32
-		)
-		r, _, e := procReadConsoleW.Call(
-			uintptr(handle),
-			uintptr(unsafe.Pointer(&buf[0])),
-			1,
-			uintptr(unsafe.Pointer(&charsRead)),
-			0,
-		)
-		if r == 0 {
-			return "", fmt.Errorf("ReadConsoleW: %w", e)
-		}
-		if charsRead == 0 {
-			break
-		}
-		ch := buf[0]
-		if ch == '\r' || ch == '\n' {
-			break
-		}
-		if ch == 0x08 || ch == 0x7F { // Backspace
-			if len(result) > 0 {
-				result = result[:len(result)-1]
-			}
-			continue
-		}
-		result = append(result, ch)
-	}
-
-	return windows.UTF16ToString(result), nil
+	return strings.TrimRight(string(b), "\r\n"), nil
 }
-
-var (
-	modKernel32      = windows.NewLazySystemDLL("kernel32.dll")
-	procReadConsoleW = modKernel32.NewProc("ReadConsoleW")
-)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Audit log helpers
