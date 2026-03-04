@@ -189,7 +189,23 @@ func (s *Scheduler) executeTask(ctx context.Context, t Task, next time.Time, run
 //   - a 5-field cron expression ("* * * * *")
 //   - "@every <duration>" (e.g., "@every 1h", "@every 30m", "@every 90s")
 //   - "@once" (runs once as soon as possible)
+const (
+	maxTaskNameLen = 128
+	maxScheduleLen = 64
+	maxPromptLen   = 10_000
+)
+
 func (s *Scheduler) Schedule(sessionID, name, schedule, prompt string) (string, error) {
+	if len(name) == 0 || len(name) > maxTaskNameLen {
+		return "", fmt.Errorf("scheduler: task name must be 1–%d characters", maxTaskNameLen)
+	}
+	if len(schedule) == 0 || len(schedule) > maxScheduleLen {
+		return "", fmt.Errorf("scheduler: schedule expression must be 1–%d characters", maxScheduleLen)
+	}
+	if len(prompt) == 0 || len(prompt) > maxPromptLen {
+		return "", fmt.Errorf("scheduler: prompt must be 1–%d characters", maxPromptLen)
+	}
+
 	now := time.Now().UTC()
 	next, err := nextRun(schedule, now)
 	if err != nil {

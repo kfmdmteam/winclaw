@@ -51,13 +51,13 @@ WinClaw takes the opposite approach:
 |---|---|
 | **Secrets** | Windows Credential Manager (DPAPI) — no `.env`, no plaintext |
 | **Data directory** | ACL: deny Everyone, grant current user + SYSTEM (`GENERIC_ALL`) |
-| **Subprocesses** | Windows Job Objects — memory cap, CPU cap, `KillOnJobClose` |
-| **IPC** | Named Pipes with per-user DACL; no Unix sockets, no TCP |
 | **Audit trail** | Windows Event Log (Application log, Source: WinClaw) + `audit_log` table |
 | **Network** | Outbound HTTPS only, TLS 1.2 minimum, no listening ports |
 | **Binary** | Built with `-s -w` (no debug symbols, stripped), Windows-only build tag |
 | **Database** | SQLite WAL, foreign keys enforced, `0600` file permissions |
 | **Memory files** | Written atomically (`tmp` + rename), `0600` permissions |
+| **API key in memory** | Stored as `[]byte`, zeroed via `client.Close()` on exit |
+| **Input validation** | Session names ≤128 chars, prompts ≤10,000 chars, schedules ≤64 chars |
 
 ---
 
@@ -302,9 +302,8 @@ winclaw/
 |---|---|---|---|
 | **Language** | Go | TypeScript | TypeScript |
 | **Runtime** | None (single binary) | Node.js | Node.js |
-| **Isolation** | Windows Job Objects | Docker / Apple Container | Docker |
 | **Secret storage** | Windows Credential Manager | `.env` files | `.env` files |
-| **IPC** | Named Pipes (per-user ACL) | Unix domain sockets | WebSocket gateway |
+| **IPC** | In-process (single binary) | Unix domain sockets | WebSocket gateway |
 | **Interface** | Terminal only | Multi-channel messaging | Multi-channel + web UI |
 | **Audit log** | Windows Event Log + SQLite | Console | Console |
 | **Startup time** | ~50ms | ~2–3s | ~3–5s |

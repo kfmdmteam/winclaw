@@ -2,6 +2,54 @@
 
 All notable changes to WinClaw are documented here.
 
+---
+
+## [0.1.1] — 2026-03-04
+
+Security audit fixes. No behaviour changes for normal usage.
+
+### Fixed
+
+- **Removed dead code: `internal/ipc/`** — The Named Pipe IPC server and
+  client were implemented but never started or called anywhere in the codebase.
+  WinClaw is a single-process application; there are no other processes to
+  communicate with. The code was removed rather than left as dormant
+  infrastructure that implied security properties it did not enforce.
+
+- **Removed dead code: `internal/security/jobobj.go`** — Windows Job Objects
+  were implemented but `NewJobObject()` was never called. No subprocess is
+  spawned in the current architecture, so there was nothing to assign to a job.
+  Removed to match reality.
+
+- **API key zeroed on exit** — `security.ReadSecret` now returns `[]byte`
+  instead of `string`. `api.Client` stores the key as `[]byte` and exposes a
+  `Close()` method that calls `clear()` on the slice. `main.go` defers
+  `apiClient.Close()` so the key is zeroed from heap memory on shutdown,
+  reducing the window in which a memory dump would expose it.
+
+- **ACL failure is now fatal** — `LockDirToCurrentUser` failure previously
+  printed a warning and allowed startup to continue with an unprotected data
+  directory. It now calls `fatalf`, aborting startup with a clear message
+  directing the user to check `SeSecurityPrivilege`.
+
+- **Input length limits** — Added validation at the entry points for
+  user-controlled strings that are stored in SQLite:
+  - Session names: 1–128 characters
+  - Schedule task names: 1–128 characters
+  - Cron/interval expressions: 1–64 characters
+  - Task prompts: 1–10,000 characters
+
+- **README: removed false certificate-pinning claim** — The README stated
+  "Certificate pinning for Anthropic API" under security controls. The code
+  only enforces TLS 1.2 minimum via `tls.Config.MinVersion`; no pinning was
+  implemented. The entry has been corrected.
+
+- **README: removed Job Objects and Named Pipes from security table** — Both
+  were listed as active security controls but were dead code. The table now
+  reflects only what the running binary actually enforces.
+
+---
+
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 

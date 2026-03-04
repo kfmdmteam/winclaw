@@ -42,9 +42,17 @@ func NewSessionManager(db *sql.DB, mem *memory.MemoryManager) *SessionManager {
 	return &SessionManager{db: db, memory: mem}
 }
 
+const maxSessionNameLen = 128
+
 // Create inserts a new session record, initialises the per-session memory
 // directory, and returns the populated Session.
 func (sm *SessionManager) Create(name string) (*Session, error) {
+	if len(name) == 0 {
+		return nil, errors.New("session: name must not be empty")
+	}
+	if len(name) > maxSessionNameLen {
+		return nil, fmt.Errorf("session: name exceeds %d characters", maxSessionNameLen)
+	}
 	id := uuid.New().String()
 	now := time.Now().UTC()
 

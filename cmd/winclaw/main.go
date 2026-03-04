@@ -80,7 +80,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Run with --setup to configure WinClaw.")
 		os.Exit(1)
 	}
-	if apiKey == "" {
+	if len(apiKey) == 0 {
 		fmt.Fprintln(os.Stderr, "WinClaw: stored API key is empty.")
 		fmt.Fprintln(os.Stderr, "Run with --setup to reconfigure.")
 		os.Exit(1)
@@ -91,8 +91,10 @@ func main() {
 		fatalf("create data dir: %v", err)
 	}
 	if err := security.LockDirToCurrentUser(cfg.DataDir); err != nil {
-		// Non-fatal: log but continue. The directory was created with 0700.
-		fmt.Fprintf(os.Stderr, "warning: could not apply ACLs to %s: %v\n", cfg.DataDir, err)
+		fatalf("could not apply ACLs to data directory %s: %v\n"+
+			"WinClaw refuses to start with an unlocked data directory.\n"+
+			"Run 'winclaw.exe --setup' to reinitialise, or check that your\n"+
+			"account has the SeSecurityPrivilege right.", cfg.DataDir, err)
 	}
 
 	// ── Open database ─────────────────────────────────────────────────────────
@@ -148,6 +150,7 @@ func main() {
 
 	// ── API client ────────────────────────────────────────────────────────────
 	apiClient := api.NewClient(apiKey, cfg.Model)
+	defer apiClient.Close() // zeros the key from heap memory on exit
 
 	// ── Agent ─────────────────────────────────────────────────────────────────
 	ag := agent.NewAgent(sess, apiClient, memMgr, cfg, nil)
@@ -221,7 +224,7 @@ func runSetup(cfg *config.Config) {
 		fatalf("create data dir: %v", err)
 	}
 	if err := security.LockDirToCurrentUser(cfg.DataDir); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not apply ACLs to %s: %v\n", cfg.DataDir, err)
+		fatalf("apply ACLs to %s: %v", cfg.DataDir, err)
 	}
 	fmt.Printf("Data directory: %s\n", cfg.DataDir)
 

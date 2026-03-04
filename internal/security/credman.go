@@ -138,12 +138,13 @@ func StoreSecret(key, value string) error {
 	return nil
 }
 
-// ReadSecret retrieves the value stored under key. Returns ErrSecretNotFound
-// if no credential with that key exists.
-func ReadSecret(key string) (string, error) {
+// ReadSecret retrieves the value stored under key and returns it as a []byte
+// so callers can zero it when done. Returns ErrSecretNotFound if no credential
+// with that key exists.
+func ReadSecret(key string) ([]byte, error) {
 	targetPtr, err := windows.UTF16PtrFromString(targetName(key))
 	if err != nil {
-		return "", fmt.Errorf("credman: encode target name: %w", err)
+		return nil, fmt.Errorf("credman: encode target name: %w", err)
 	}
 
 	var pcred *credential
@@ -154,20 +155,24 @@ func ReadSecret(key string) (string, error) {
 		uintptr(unsafe.Pointer(&pcred)),
 	)
 	if r == 0 {
-		return "", fmt.Errorf("credman: CredReadW: %w", classifyError(e))
+		return nil, fmt.Errorf("credman: CredReadW: %w", classifyError(e))
 	}
 	defer procCredFree.Call(uintptr(unsafe.Pointer(pcred)))
 
 	if pcred.CredentialBlobSize == 0 || pcred.CredentialBlob == nil {
-		return "", nil
+		return []byte{}, nil
 	}
 
 	blob := unsafe.Slice(pcred.CredentialBlob, pcred.CredentialBlobSize)
-	// Make a copy before CredFree runs.
+	// Decode UTF-16LE blob into a UTF-8 []byte owned by Go.
 	blobCopy := make([]byte, len(blob))
 	copy(blobCopy, blob)
+	result := []byte(decodeUTF16Bytes(blobCopy))
 
-	return decodeUTF16Bytes(blobCopy), nil
+	// Zero the intermediate copy so the raw blob is not left in heap memory.
+	clear(blobCopy)
+
+	return result, nil
 }
 
 // DeleteSecret removes the credential stored under key. Returns
@@ -192,6 +197,10 @@ func DeleteSecret(key string) error {
 // HasSecret reports whether a credential is stored under key. It returns false
 // for any error, including permission errors, to give a safe boolean answer.
 func HasSecret(key string) bool {
-	_, err := ReadSecret(key)
-	return err == nil
+	val, err := ReadSecret(key)
+	if err != nil {
+		return false
+	}
+	clear(val)
+	return true
 }

@@ -21,15 +21,19 @@ const (
 )
 
 // Client is an HTTP client for the Anthropic Messages API.
+// The API key is stored as []byte so it can be zeroed via Close when the
+// application shuts down, limiting the window during which a memory dump
+// would expose it.
 type Client struct {
-	apiKey     string
+	apiKey     []byte
 	baseURL    string
 	httpClient *http.Client
 	model      string
 }
 
 // NewClient creates a new Anthropic API client with TLS 1.2+ and a 120s timeout.
-func NewClient(apiKey, model string) *Client {
+// The caller should defer Client.Close() to zero the key from memory on exit.
+func NewClient(apiKey []byte, model string) *Client {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
@@ -44,6 +48,11 @@ func NewClient(apiKey, model string) *Client {
 			Transport: transport,
 		},
 	}
+}
+
+// Close zeros the API key in memory. Safe to call more than once.
+func (c *Client) Close() {
+	clear(c.apiKey)
 }
 
 // SendMessage sends a non-streaming request and returns the full response.
@@ -130,7 +139,7 @@ func (c *Client) doRequest(ctx context.Context, body []byte) (*http.Response, er
 		return nil, fmt.Errorf("api: create request: %w", err)
 	}
 
-	httpReq.Header.Set("x-api-key", c.apiKey)
+	httpReq.Header.Set("x-api-key", string(c.apiKey))
 	httpReq.Header.Set("anthropic-version", anthropicVersion)
 	httpReq.Header.Set("content-type", "application/json")
 
