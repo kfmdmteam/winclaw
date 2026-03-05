@@ -14,14 +14,18 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sys/windows/svc"
+
 	"winclaw/internal/agent"
 	"winclaw/internal/api"
 	"winclaw/internal/config"
 	"winclaw/internal/db"
+	"winclaw/internal/ipc"
 	"winclaw/internal/logging"
 	"winclaw/internal/memory"
 	"winclaw/internal/scheduler"
 	"winclaw/internal/security"
+	svcpkg "winclaw/internal/service"
 	"winclaw/internal/terminal"
 	"winclaw/internal/tools"
 )
@@ -32,13 +36,29 @@ const (
 )
 
 func main() {
+	// ── Windows Service auto-detection ────────────────────────────────────────
+	// When the SCM launches us, svc.IsWindowsService returns true. In that case
+	// we skip the REPL entirely and hand control to the service handler.
+	if isService, err := svc.IsWindowsService(); err == nil && isService {
+		if runErr := svcpkg.Run(); runErr != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
 	// ── Flags ────────────────────────────────────────────────────────────────
-	flagVersion  := flag.Bool("version", false, "print version and exit")
-	flagSetup    := flag.Bool("setup", false, "run first-time setup wizard")
-	flagSession  := flag.String("session", "", "session ID to resume")
-	flagModel    := flag.String("model", "", "override the model (e.g. claude-opus-4-6)")
-	flagNoColor := flag.Bool("no-color", false, "disable ANSI colour output")
-	flagLogLevel := flag.String("log-level", "", "log level: debug, info, warning, error")
+	flagVersion         := flag.Bool("version", false, "print version and exit")
+	flagSetup           := flag.Bool("setup", false, "run first-time setup wizard")
+	flagSession         := flag.String("session", "", "session ID to resume")
+	flagModel           := flag.String("model", "", "override the model (e.g. claude-opus-4-6)")
+	flagNoColor         := flag.Bool("no-color", false, "disable ANSI colour output")
+	flagLogLevel        := flag.String("log-level", "", "log level: debug, info, warning, error")
+	flagInstallService  := flag.Bool("install-service", false, "register WinClaw as a Windows Service (requires administrator)")
+	flagUninstallService := flag.Bool("uninstall-service", false, "remove the WinClaw Windows Service (requires administrator)")
+	flagStartService    := flag.Bool("start-service", false, "start the WinClaw service via SCM")
+	flagStopService     := flag.Bool("stop-service", false, "stop the WinClaw service via SCM")
+	flagServiceStatus   := flag.Bool("service-status", false, "print the service status and exit")
+	flagSend            := flag.String("send", "", "send a prompt to the running service and stream the response")
 	flag.Parse()
 
 	// ── Version ──────────────────────────────────────────────────────────────
@@ -69,6 +89,68 @@ func main() {
 		os.Exit(0)
 	}
 
+	// ── Service status (no credentials required) ──────────────────────────────
+	if *flagServiceStatus {
+		fmt.Printf("WinClaw service: %s\n", svcpkg.Status())
+		os.Exit(0)
+	}
+
+	// ── Service stop (no API key required) ────────────────────────────────────
+	if *flagStopService {
+		if err := svcpkg.Stop(); err != nil {
+			fatalf("stop service: %v", err)
+		}
+		fmt.Println("WinClaw service: stop signal sent.")
+		os.Exit(0)
+	}
+
+	// ── Service uninstall ─────────────────────────────────────────────────────
+	if *flagUninstallService {
+		if err := svcpkg.Uninstall(); err != nil {
+			fatalf("uninstall service: %v", err)
+		}
+		fmt.Println("WinClaw service uninstalled.")
+		os.Exit(0)
+	}
+
+	// ── Send prompt to running service ────────────────────────────────────────
+	if *flagSend != "" {
+		sessionID := *flagSession
+		prompt := strings.TrimSpace(*flagSend)
+		if prompt == "" {
+			fatalf("--send requires a non-empty prompt")
+		}
+		chunks, err := ipc.Send(sessionID, prompt)
+		if err != nil {
+			fatalf("send: %v", err)
+		}
+		for c := range chunks {
+			if c.Tool != "" {
+				fmt.Printf("\n  ▸ %s\n", c.Tool)
+				continue
+			}
+			if c.Text != "" {
+				fmt.Print(c.Text)
+			}
+			if c.Done {
+				fmt.Println()
+				if c.Error != "" {
+					fatalf("service error: %s", c.Error)
+				}
+			}
+		}
+		os.Exit(0)
+	}
+
+	// ── Service start ─────────────────────────────────────────────────────────
+	if *flagStartService {
+		if err := svcpkg.Start(); err != nil {
+			fatalf("start service: %v", err)
+		}
+		fmt.Println("WinClaw service: started.")
+		os.Exit(0)
+	}
+
 	// ── Read API key from Credential Manager ─────────────────────────────────
 	apiKey, err := security.ReadSecret(apiKeyName)
 	if err != nil {
@@ -91,6 +173,12 @@ func main() {
 			"WinClaw refuses to start with an unlocked data directory.\n"+
 			"Run 'winclaw.exe --setup' to reinitialise, or check that your\n"+
 			"account has the SeSecurityPrivilege right.", cfg.DataDir, err)
+	}
+
+	// ── Install service ───────────────────────────────────────────────────────
+	if *flagInstallService {
+		runInstallService(cfg, apiKey)
+		os.Exit(0)
 	}
 
 	// ── Open database ─────────────────────────────────────────────────────────
@@ -208,6 +296,90 @@ func main() {
 	// ── Shutdown ──────────────────────────────────────────────────────────────
 	evtLog.Security("shutdown", "winclaw", fmt.Sprintf("version=%s", version))
 	sched.Stop()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Service installation
+// ─────────────────────────────────────────────────────────────────────────────
+
+// runInstallService registers WinClaw as a Windows Service and prepares the
+// machine-DPAPI-encrypted key file that the service reads at runtime.
+// Must be run as administrator (CreateService requires it).
+func runInstallService(cfg *config.Config, apiKey []byte) {
+	exePath, err := os.Executable()
+	if err != nil {
+		fatalf("resolve executable path: %v", err)
+	}
+	exePath, err = filepath.Abs(exePath)
+	if err != nil {
+		fatalf("make path absolute: %v", err)
+	}
+
+	// Warn if the binary is in a user-writable location.
+	lower := strings.ToLower(exePath)
+	if strings.Contains(lower, "\\temp\\") ||
+		strings.Contains(lower, "\\downloads\\") ||
+		strings.Contains(lower, "\\appdata\\local\\temp\\") {
+		fmt.Fprintf(os.Stderr, "WARNING: binary is in a temporary location (%s).\n", exePath)
+		fmt.Fprintf(os.Stderr, "         Copy it to a permanent path before continuing.\n")
+	}
+
+	fmt.Printf("Installing service for: %s\n", exePath)
+
+	// Get the installing user's SID for pipe and file ACLs.
+	userSID, err := security.GetCurrentUserSID()
+	if err != nil {
+		fatalf("get user SID: %v", err)
+	}
+	userSIDStr := userSID.String()
+
+	// Re-encrypt the API key with machine DPAPI so LocalService can read it.
+	encKey, err := security.EncryptMachine(apiKey)
+	if err != nil {
+		fatalf("encrypt service key: %v", err)
+	}
+
+	keyPath := svcpkg.ServiceKeyPath(cfg.DataDir)
+	if err := os.WriteFile(keyPath, encKey, 0600); err != nil {
+		fatalf("write service-key.enc: %v", err)
+	}
+
+	// Lock service-key.enc to user + LocalService only.
+	lsSID, err := security.LocalServiceSID()
+	if err != nil {
+		fatalf("get LocalService SID: %v", err)
+	}
+	if err := security.GrantFileToSIDs(keyPath, userSID, lsSID); err != nil {
+		fatalf("ACL service-key.enc: %v", err)
+	}
+	fmt.Printf("Service key written and locked: %s\n", keyPath)
+
+	// Re-apply data directory ACL to include LocalService.
+	if err := security.LockDirToService(cfg.DataDir); err != nil {
+		fatalf("ACL data directory for service: %v", err)
+	}
+	fmt.Printf("Data directory ACL updated: %s\n", cfg.DataDir)
+
+	// Store the owner SID in config so the service can set the pipe DACL.
+	cfg.ServiceOwnerSID = userSIDStr
+	if err := cfg.Save(); err != nil {
+		fatalf("save config: %v", err)
+	}
+	fmt.Printf("Config saved with ServiceOwnerSID: %s\n", userSIDStr)
+
+	// Register the Windows Service.
+	if err := svcpkg.Install(exePath); err != nil {
+		fatalf("%v", err)
+	}
+
+	fmt.Println()
+	fmt.Println("Service installed successfully.")
+	fmt.Println()
+	fmt.Println("To start:        winclaw.exe --start-service")
+	fmt.Println("To check status: winclaw.exe --service-status")
+	fmt.Println("To send a prompt: winclaw.exe --send \"your prompt here\"")
+	fmt.Println("To stop:         winclaw.exe --stop-service")
+	fmt.Println("To remove:       winclaw.exe --uninstall-service")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -42,6 +42,11 @@ type Config struct {
 	// primary lever for controlling per-request token cost.
 	// Default: 20 (40 messages). Set lower for cheaper sessions.
 	HistoryWindow int `json:"history_window"`
+
+	// ServiceOwnerSID is the string form of the SID of the user who ran
+	// --install-service. The named pipe DACL uses this to restrict --send
+	// access to that user only. Set automatically at install time.
+	ServiceOwnerSID string `json:"service_owner_sid,omitempty"`
 }
 
 // defaults returns a Config populated entirely with safe default values.

@@ -57,6 +57,116 @@ func buildWellKnownSID(sidType windows.WELL_KNOWN_SID_TYPE) (*windows.SID, error
 	return sid, nil
 }
 
+// LocalServiceSID returns the built-in LocalService SID (S-1-5-19).
+func LocalServiceSID() (*windows.SID, error) {
+	return buildWellKnownSID(windows.WinLocalServiceSid)
+}
+
+// LockDirToService applies a protected DACL granting GENERIC_ALL to the
+// current user, SYSTEM, and LocalService. Call this at --install-service time
+// so the service account can read and write the data directory.
+func LockDirToService(path string) error {
+	userSID, err := GetCurrentUserSID()
+	if err != nil {
+		return err
+	}
+	systemSID, err := buildWellKnownSID(windows.WinLocalSystemSid)
+	if err != nil {
+		return err
+	}
+	lsSID, err := buildWellKnownSID(windows.WinLocalServiceSid)
+	if err != nil {
+		return err
+	}
+
+	inheritFlags := windows.CONTAINER_INHERIT_ACE | windows.OBJECT_INHERIT_ACE
+
+	dacl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{
+		{
+			AccessPermissions: windows.ACCESS_MASK(genericAll),
+			AccessMode:        windows.GRANT_ACCESS,
+			Inheritance:       uint32(inheritFlags),
+			Trustee: windows.TRUSTEE{
+				TrusteeForm:  windows.TRUSTEE_IS_SID,
+				TrusteeType:  windows.TRUSTEE_IS_USER,
+				TrusteeValue: windows.TrusteeValueFromSID(userSID),
+			},
+		},
+		{
+			AccessPermissions: windows.ACCESS_MASK(genericAll),
+			AccessMode:        windows.GRANT_ACCESS,
+			Inheritance:       uint32(inheritFlags),
+			Trustee: windows.TRUSTEE{
+				TrusteeForm:  windows.TRUSTEE_IS_SID,
+				TrusteeType:  windows.TRUSTEE_IS_WELL_KNOWN_GROUP,
+				TrusteeValue: windows.TrusteeValueFromSID(systemSID),
+			},
+		},
+		{
+			AccessPermissions: windows.ACCESS_MASK(genericAll),
+			AccessMode:        windows.GRANT_ACCESS,
+			Inheritance:       uint32(inheritFlags),
+			Trustee: windows.TRUSTEE{
+				TrusteeForm:  windows.TRUSTEE_IS_SID,
+				TrusteeType:  windows.TRUSTEE_IS_WELL_KNOWN_GROUP,
+				TrusteeValue: windows.TrusteeValueFromSID(lsSID),
+			},
+		},
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("acl: ACLFromEntries: %w", err)
+	}
+
+	return applyDACL(path, dacl)
+}
+
+// GrantFileToSIDs applies a protected, non-inheriting DACL to a single file
+// granting GENERIC_ALL to each SID. Used to lock down service-key.enc.
+func GrantFileToSIDs(path string, sids ...*windows.SID) error {
+	entries := make([]windows.EXPLICIT_ACCESS, len(sids))
+	for i, sid := range sids {
+		entries[i] = windows.EXPLICIT_ACCESS{
+			AccessPermissions: windows.ACCESS_MASK(genericAll),
+			AccessMode:        windows.GRANT_ACCESS,
+			Inheritance:       windows.NO_INHERITANCE,
+			Trustee: windows.TRUSTEE{
+				TrusteeForm:  windows.TRUSTEE_IS_SID,
+				TrusteeType:  windows.TRUSTEE_IS_UNKNOWN,
+				TrusteeValue: windows.TrusteeValueFromSID(sid),
+			},
+		}
+	}
+
+	dacl, err := windows.ACLFromEntries(entries, nil)
+	if err != nil {
+		return fmt.Errorf("acl: ACLFromEntries: %w", err)
+	}
+	return applyDACL(path, dacl)
+}
+
+// applyDACL sets a protected DACL on path via SetNamedSecurityInfoW.
+func applyDACL(path string, dacl *windows.ACL) error {
+	pathPtr, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return fmt.Errorf("acl: encode path: %w", err)
+	}
+	secInfo := windows.SECURITY_INFORMATION(
+		windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION,
+	)
+	ret, _, e := procSetNamedSecurityInfoW.Call(
+		uintptr(unsafe.Pointer(pathPtr)),
+		seFileObject,
+		uintptr(secInfo),
+		0, 0,
+		uintptr(unsafe.Pointer(dacl)),
+		0,
+	)
+	if ret != 0 {
+		return fmt.Errorf("acl: SetNamedSecurityInfoW(%q): %w", path, e)
+	}
+	return nil
+}
+
 // LockDirToCurrentUser applies a protected DACL to path so that only the
 // current user and the built-in SYSTEM account retain access. The DACL is
 // marked protected, which blocks ACE inheritance from the parent directory.
@@ -106,29 +216,5 @@ func LockDirToCurrentUser(path string) error {
 		return fmt.Errorf("acl: ACLFromEntries: %w", err)
 	}
 
-	pathPtr, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return fmt.Errorf("acl: encode path: %w", err)
-	}
-
-	// DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION:
-	// replace the DACL and block inheritance from the parent.
-	secInfo := windows.SECURITY_INFORMATION(
-		windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION,
-	)
-
-	// SetNamedSecurityInfoW returns ERROR_SUCCESS (0) on success.
-	ret, _, e := procSetNamedSecurityInfoW.Call(
-		uintptr(unsafe.Pointer(pathPtr)),
-		seFileObject,
-		uintptr(secInfo),
-		0,                            // pSidOwner — unchanged
-		0,                            // pSidGroup — unchanged
-		uintptr(unsafe.Pointer(dacl)),
-		0,                            // pSacl — unchanged
-	)
-	if ret != 0 {
-		return fmt.Errorf("acl: SetNamedSecurityInfoW(%q): %w", path, e)
-	}
-	return nil
+	return applyDACL(path, dacl)
 }
