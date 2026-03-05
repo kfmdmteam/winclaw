@@ -125,6 +125,7 @@ func (ws *winClawService) Execute(
 		tl := tools.NewRegistry(
 			func(content string) error { return memMgr.Append(sess.ID, content) },
 			func(content string) error { return memMgr.WriteSoul(content) },
+			tools.Options{GlobalUpdate: func(c string) error { return memMgr.AppendGlobal(c) }},
 		)
 		ag := agent.NewAgent(sess, apiClient, memMgr, cfg, tl, nil)
 		_, runErr := ag.Run(ctx, prompt)
@@ -196,6 +197,7 @@ func makePipeHandler(
 		tl := tools.NewRegistry(
 			func(content string) error { return memMgr.Append(sess.ID, content) },
 			func(content string) error { return memMgr.WriteSoul(content) },
+			tools.Options{GlobalUpdate: func(c string) error { return memMgr.AppendGlobal(c) }},
 		)
 		ag := agent.NewAgent(sess, apiClient, memMgr, cfg, tl, func(chunk string) {
 			if strings.HasPrefix(chunk, "\x00TOOL\x00") {

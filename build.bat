@@ -41,7 +41,7 @@ echo Vet OK.
 echo.
 
 :: Build flags
-set LDFLAGS=-s -w -X main.version=v0.1.0
+set LDFLAGS=-s -w -X main.version=v0.2.0
 set BUILD_TAGS=windows
 
 if "%1"=="release" (

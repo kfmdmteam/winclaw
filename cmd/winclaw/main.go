@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"os"
@@ -30,10 +31,12 @@ import (
 	"winclaw/internal/tools"
 )
 
-const (
-	version    = "v0.1.0"
-	apiKeyName = "AnthropicAPIKey"
-)
+const apiKeyName = "AnthropicAPIKey"
+
+// version is a var so the build script can inject the correct value via
+// -ldflags "-X main.version=vX.Y.Z". The fallback keeps the binary useful
+// even if built without the flag.
+var version = "v0.2.0"
 
 func main() {
 	// ── Windows Service auto-detection ────────────────────────────────────────
@@ -53,12 +56,13 @@ func main() {
 	flagModel           := flag.String("model", "", "override the model (e.g. claude-opus-4-6)")
 	flagNoColor         := flag.Bool("no-color", false, "disable ANSI colour output")
 	flagLogLevel        := flag.String("log-level", "", "log level: debug, info, warning, error")
-	flagInstallService  := flag.Bool("install-service", false, "register WinClaw as a Windows Service (requires administrator)")
+	flagInstallService   := flag.Bool("install-service", false, "register WinClaw as a Windows Service (requires administrator)")
 	flagUninstallService := flag.Bool("uninstall-service", false, "remove the WinClaw Windows Service (requires administrator)")
-	flagStartService    := flag.Bool("start-service", false, "start the WinClaw service via SCM")
-	flagStopService     := flag.Bool("stop-service", false, "stop the WinClaw service via SCM")
-	flagServiceStatus   := flag.Bool("service-status", false, "print the service status and exit")
-	flagSend            := flag.String("send", "", "send a prompt to the running service and stream the response")
+	flagStartService     := flag.Bool("start-service", false, "start the WinClaw service via SCM")
+	flagStopService      := flag.Bool("stop-service", false, "stop the WinClaw service via SCM")
+	flagServiceStatus    := flag.Bool("service-status", false, "print the service status and exit")
+	flagSend             := flag.String("send", "", "send a prompt to the running service and stream the response")
+	flagAttach           := flag.String("attach", "", "attach an image file to the initial prompt (use with --send or REPL)")
 	flag.Parse()
 
 	// ── Version ──────────────────────────────────────────────────────────────
@@ -241,14 +245,68 @@ func main() {
 	apiClient := api.NewClient(apiKey, cfg.Model)
 	defer apiClient.Close() // zeros the key from heap memory on exit
 
+	// ── Plugin directory ──────────────────────────────────────────────────────
+	pluginDir := filepath.Join(cfg.DataDir, "plugins")
+	_ = os.MkdirAll(pluginDir, 0700) // create if absent; non-fatal
+
+	// makeOpts builds a tools.Options for a given session, wiring global memory
+	// and a delegate function that spawns a fresh sub-agent.
+	makeOpts := func(s *agent.Session) tools.Options {
+		return tools.Options{
+			GlobalUpdate: func(content string) error { return memMgr.AppendGlobal(content) },
+			DelegateFunc: func(ctx context.Context, prompt string) (string, error) {
+				tempSess := &agent.Session{
+					ID:       fmt.Sprintf("delegate-%d", time.Now().UnixNano()),
+					Name:     "delegate",
+					Messages: nil,
+				}
+				tl := tools.NewRegistry(
+					func(c string) error { return memMgr.Append(tempSess.ID, c) },
+					func(c string) error { return memMgr.WriteSoul(c) },
+					tools.Options{GlobalUpdate: func(c string) error { return memMgr.AppendGlobal(c) }},
+				)
+				sub := agent.NewAgent(tempSess, apiClient, memMgr, cfg, tl, nil)
+				return sub.Run(ctx, prompt)
+			},
+			PluginDir: pluginDir,
+		}
+	}
+
 	// ── Tools ─────────────────────────────────────────────────────────────────
 	toolRegistry := tools.NewRegistry(
 		func(content string) error { return memMgr.Append(sess.ID, content) },
 		func(content string) error { return memMgr.WriteSoul(content) },
+		makeOpts(sess),
 	)
 
 	// ── Agent ─────────────────────────────────────────────────────────────────
 	ag := agent.NewAgent(sess, apiClient, memMgr, cfg, toolRegistry, nil)
+
+	// Optional startup image attachment (--attach flag).
+	if *flagAttach != "" {
+		imgData, imgErr := os.ReadFile(*flagAttach)
+		if imgErr != nil {
+			fatalf("attach: read %q: %v", *flagAttach, imgErr)
+		}
+		mediaType := "image/png"
+		switch strings.ToLower(filepath.Ext(*flagAttach)) {
+		case ".jpg", ".jpeg":
+			mediaType = "image/jpeg"
+		case ".gif":
+			mediaType = "image/gif"
+		case ".webp":
+			mediaType = "image/webp"
+		}
+		ag.SetAttachment(&api.ContentBlock{
+			Type: "image",
+			Source: &api.ImageSource{
+				Type:      "base64",
+				MediaType: mediaType,
+				Data:      base64.StdEncoding.EncodeToString(imgData),
+			},
+		})
+		fmt.Printf("Image attached: %s (%d bytes)\n", filepath.Base(*flagAttach), len(imgData))
+	}
 
 	// ── Scheduler ────────────────────────────────────────────────────────────
 	sched := scheduler.NewScheduler(database.Conn(), func(ctx context.Context, sessionID, prompt string) error {
@@ -259,6 +317,10 @@ func main() {
 		schedTools := tools.NewRegistry(
 			func(content string) error { return memMgr.Append(scheduledSess.ID, content) },
 			func(content string) error { return memMgr.WriteSoul(content) },
+			tools.Options{
+				GlobalUpdate: func(c string) error { return memMgr.AppendGlobal(c) },
+				PluginDir:    pluginDir,
+			},
 		)
 		scheduledAgent := agent.NewAgent(scheduledSess, apiClient, memMgr, cfg, schedTools, nil)
 		_, runErr := scheduledAgent.Run(ctx, prompt)
@@ -284,6 +346,7 @@ func main() {
 		return tools.NewRegistry(
 			func(content string) error { return memMgr.Append(s.ID, content) },
 			func(content string) error { return memMgr.WriteSoul(content) },
+			makeOpts(s),
 		)
 	}
 	repl := terminal.NewREPL(cfg, sess, ag, sessionMgr, memMgr, sched, noColor, toolsMaker, version)

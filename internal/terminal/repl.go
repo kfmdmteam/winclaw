@@ -4,9 +4,11 @@ package terminal
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"golang.org/x/term"
 
 	"winclaw/internal/agent"
+	"winclaw/internal/api"
 	"winclaw/internal/config"
 	"winclaw/internal/memory"
 	"winclaw/internal/scheduler"
@@ -85,6 +88,11 @@ type REPL struct {
 
 	history    []string
 	historyIdx int // points one past the last item (insertion point)
+
+	// totalTokens accumulates API token usage across all turns in this session.
+	// The agent is recreated on every turn, so we accumulate here rather than
+	// reading agentObj.TokensUsed directly (which resets each turn).
+	totalTokens int
 
 	ansiOK  bool // whether the terminal supports ANSI
 	noColor bool // user-requested --no-color override
@@ -593,6 +601,7 @@ func (r *REPL) runAgent(ctx context.Context, input string) {
 	)
 
 	_, err := r.agentObj.Run(agentCtx, input)
+	r.totalTokens += r.agentObj.TokensUsed
 	ensureSpinnerStopped()
 
 	if err != nil {
@@ -670,6 +679,26 @@ func (r *REPL) handleCommand(ctx context.Context, line string) {
 		}
 		r.cmdSchedule(parts[1:])
 
+	case "/think":
+		r.cmdThink()
+
+	case "/attach":
+		if len(parts) < 2 {
+			r.printError("/attach requires a file path")
+			return
+		}
+		r.cmdAttach(parts[1])
+
+	case "/global":
+		r.cmdGlobalMemory()
+
+	case "/soul":
+		if len(parts) >= 2 && strings.ToLower(parts[1]) == "edit" {
+			r.cmdSoulEdit()
+		} else {
+			r.cmdSoulShow()
+		}
+
 	case "/status":
 		r.cmdStatus()
 
@@ -696,8 +725,13 @@ func (r *REPL) cmdHelp() {
 		{"/switch <id-or-name>", "switch to a different session"},
 		{"/delete <id>", "soft-delete a session"},
 		{"/reset", "clear conversation history (memory file kept)"},
-		{"/memory", "show the current CLAUDE.md content"},
-		{"/memory edit", "open CLAUDE.md in Notepad for editing"},
+		{"/memory", "show session memory"},
+		{"/memory edit", "open session memory in Notepad"},
+		{"/global", "show global cross-session memory"},
+		{"/soul", "show the soul file (persistent identity)"},
+		{"/soul edit", "open soul file in Notepad"},
+		{"/think", "toggle extended thinking mode (slower, deeper)"},
+		{"/attach <path>", "attach an image file to your next message"},
 		{"/schedule list", "list scheduled tasks for this session"},
 		{"/schedule add <name> <cron> <prompt>", "add a scheduled task"},
 		{"/schedule pause <id>", "pause a scheduled task"},
@@ -951,17 +985,8 @@ func (r *REPL) cmdStatus() {
 		return
 	}
 
-	// Count in-memory message turns.
+	// Count in-memory message turns (each turn = 1 user + 1 assistant message).
 	turns := len(r.session.Messages) / 2
-
-	// Approximate token usage by character count (rough heuristic).
-	var totalChars int
-	for _, msg := range r.session.Messages {
-		switch c := msg.Content.(type) {
-		case string:
-			totalChars += len(c)
-		}
-	}
 
 	// Memory file size.
 	memContent, _ := r.memory.Read(r.session.ID)
@@ -973,10 +998,95 @@ func (r *REPL) cmdStatus() {
 	r.print(fmt.Sprintf("  Created     : %s\r\n", r.session.CreatedAt.Local().Format(time.RFC3339)))
 	r.print(fmt.Sprintf("  Last active : %s\r\n", r.session.LastActive.Local().Format(time.RFC3339)))
 	r.print(fmt.Sprintf("  Turns       : %d\r\n", turns))
-	r.print(fmt.Sprintf("  Approx chars: %d\r\n", totalChars))
+	r.print(fmt.Sprintf("  Tokens used : %d\r\n", r.totalTokens))
 	r.print(fmt.Sprintf("  Memory size : %d bytes\r\n", memSize))
 	r.print(fmt.Sprintf("  Model       : %s\r\n", r.cfg.Model))
+	r.print(fmt.Sprintf("  Thinking    : %v\r\n", r.agentObj.UseThinking))
 	r.print("\r\n")
+}
+
+func (r *REPL) cmdThink() {
+	r.agentObj.UseThinking = !r.agentObj.UseThinking
+	if r.agentObj.UseThinking {
+		r.printSystem(fmt.Sprintf("Extended thinking enabled (budget: %d tokens). Responses will be deeper and slower.\r\n", r.agentObj.ThinkingBudget))
+	} else {
+		r.printSystem("Extended thinking disabled.\r\n")
+	}
+}
+
+func (r *REPL) cmdAttach(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		r.printError(fmt.Sprintf("attach: read file: %v", err))
+		return
+	}
+
+	mediaType := "image/png"
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".jpg", ".jpeg":
+		mediaType = "image/jpeg"
+	case ".gif":
+		mediaType = "image/gif"
+	case ".webp":
+		mediaType = "image/webp"
+	}
+
+	b64 := base64.StdEncoding.EncodeToString(data)
+	block := &api.ContentBlock{
+		Type: "image",
+		Source: &api.ImageSource{
+			Type:      "base64",
+			MediaType: mediaType,
+			Data:      b64,
+		},
+	}
+	r.agentObj.SetAttachment(block)
+	r.printSystem(fmt.Sprintf("Attached %s (%d bytes). It will be included with your next message.\r\n",
+		filepath.Base(path), len(data)))
+}
+
+func (r *REPL) cmdGlobalMemory() {
+	content, err := r.memory.ReadGlobal()
+	if err != nil {
+		r.printError(fmt.Sprintf("read global memory: %v", err))
+		return
+	}
+	if strings.TrimSpace(content) == "" {
+		r.printSystem("(global memory file is empty)\r\n")
+		return
+	}
+	r.print("\r\n" + r.colour(colorOutput, content) + "\r\n")
+}
+
+func (r *REPL) cmdSoulShow() {
+	content, err := r.memory.ReadSoul()
+	if err != nil {
+		r.printError(fmt.Sprintf("read soul: %v", err))
+		return
+	}
+	r.print("\r\n" + r.colour(colorOutput, content) + "\r\n")
+}
+
+func (r *REPL) cmdSoulEdit() {
+	soulPath := r.memory.SoulPath()
+	// Ensure the soul file exists before opening the editor.
+	if err := r.memory.InitSoul(); err != nil {
+		r.printError(fmt.Sprintf("init soul file: %v", err))
+		return
+	}
+
+	fd := int(os.Stdin.Fd())
+	old, _ := term.GetState(fd)
+	_ = term.Restore(fd, old)
+
+	cmd := exec.Command("notepad.exe", soulPath)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	_ = cmd.Run()
+
+	_, _ = term.MakeRaw(fd)
+	r.printSystem("soul file updated\r\n")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

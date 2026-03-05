@@ -4,6 +4,116 @@ All notable changes to WinClaw are documented here.
 
 ---
 
+## [0.2.0] — 2026-03-05
+
+### Added
+
+**Windows Service mode**
+- `--install-service` / `--uninstall-service` flags register and remove WinClaw
+  as a Windows Service running under `NT AUTHORITY\LocalService`.
+- `--start-service` / `--stop-service` / `--service-status` flags control the
+  service via the Service Control Manager without requiring elevation after
+  initial install.
+- Machine-DPAPI (`CryptProtectData` with `CRYPTPROTECT_LOCAL_MACHINE`) encrypts
+  the API key into `service-key.enc` so the service can read it without access
+  to the installing user's Credential Manager session.
+- `internal/service/` package implements the `svc.Handler` interface:
+  startup, scheduler launch, named pipe server, SCM command loop, and clean
+  shutdown with in-flight-task draining.
+
+**Named Pipe IPC (`--send`)**
+- `--send "<prompt>"` connects to the running service over `\\.\pipe\WinClaw`
+  and streams the response to stdout — usable from scripts, scheduled tasks,
+  and other terminals.
+- Pipe DACL grants access only to `SYSTEM`, `LocalService`, and the SID of the
+  user who ran `--install-service`; anonymous connections are rejected.
+- `internal/ipc/pipe.go`: length-prefixed JSON frame protocol (server + client).
+
+**Extended Thinking**
+- `/think` toggles extended thinking on the current session agent.
+- When enabled, each API request carries `"thinking": {"type":"enabled",
+  "budget_tokens": 10000}` and the `anthropic-beta: interleaved-thinking-…`
+  header.
+- `/status` now shows the current thinking state.
+
+**Image Attachment**
+- `/attach <path>` attaches a PNG/JPEG/GIF/WEBP file; it is included as a
+  base64 image block with your next message.
+- `--attach <path>` attaches an image at startup so it can be used with
+  `--send` or a REPL session.
+
+**Soul File**
+- `%APPDATA%\WinClaw\SOUL.md` is a persistent identity/values file injected
+  into every system prompt ahead of session memory.
+- Default soul is written on first run; describes WinClaw's persona, tools,
+  operating rules, and Windows-native knowledge.
+- `/soul` displays the current soul file; `/soul edit` opens it in Notepad.
+- `update_soul` tool lets the model rewrite its own soul file when
+  self-understanding evolves.
+
+**Global Cross-Session Memory**
+- `%APPDATA%\WinClaw\GLOBAL.md` persists across all sessions.
+- `/global` displays the global memory file.
+- `update_global_memory` tool lets the model append facts that should survive
+  across session boundaries (user preferences, long-lived project context).
+
+**Windows-Native Tools**
+- `screenshot` — captures the primary monitor as PNG via GDI+; the image is
+  returned as a base64 block so the model can visually analyse the screen.
+- `process_list` — lists running processes by CPU/memory usage via `Get-Process`.
+- `kill_process` — terminates a process by PID or name.
+- `toast_notify` — sends a Windows desktop balloon notification via
+  `System.Windows.Forms.NotifyIcon`.
+- `run_elevated` — runs a PowerShell command via `Start-Process -Verb RunAs`
+  (triggers UAC); output is captured via a temp file.
+- `registry_read` / `registry_write` — reads/writes Windows registry values
+  via `Get-ItemProperty` / `Set-ItemProperty`.
+
+**Plugin System**
+- `%APPDATA%\WinClaw\plugins\*.ps1` files with a `# WinClaw-Plugin` header
+  block are loaded at startup and exposed as agent tools.
+- Plugin parameters are declared in a `# Parameters:` header line as a JSON
+  Schema object.
+- Plugins are called with `-InputJson '<json>'`; output is returned verbatim.
+
+**Delegate Tool**
+- `delegate` tool spawns a fresh sub-agent with a clean context to handle
+  isolated sub-tasks, then returns the result to the parent agent.
+- Sub-agents inherit all tools (except `delegate` itself to prevent recursion
+  inadvertently) and share global memory.
+
+**Auto-Consolidation**
+- When a session memory file exceeds 8 KB, the agent automatically summarises
+  it in the background using a separate non-streaming API call (2048-token
+  budget). The consolidated result replaces the raw file.
+
+**REPL additions**
+- `/global` — display the global cross-session memory file.
+- `/soul` / `/soul edit` — display or edit the soul file.
+- `/attach <path>` — attach an image to the next message.
+- `/think` — toggle extended thinking.
+- `/status` now shows actual API token usage (accumulated across all turns in
+  the session) and the current thinking mode.
+
+**Auto-context in system prompt**
+- Working directory and git branch are injected automatically into every system
+  prompt under `## Environment`, giving the model situational awareness without
+  requiring the user to state the context explicitly.
+
+### Fixed
+
+- `version` changed from `const` to `var` so `-ldflags "-X main.version=…"` in
+  `build.bat` correctly injects the version at link time.
+- Single-quote injection in Windows-native tool PowerShell scripts: all
+  user-supplied strings embedded in PS single-quoted literals are now sanitised
+  with `psEscape()` (doubles `'` to `''`). Affected tools: `process_list`,
+  `kill_process`, `toast_notify`, `registry_read`, `registry_write`.
+- `registry_write` now validates the `type` argument against an allowlist
+  (`String`, `DWord`, `QWord`, `Binary`, `ExpandString`, `MultiString`) before
+  inserting it unquoted into the PowerShell command.
+
+---
+
 ## [0.1.1] — 2026-03-04
 
 Security audit fixes. No behaviour changes for normal usage.

@@ -14,10 +14,10 @@ import (
 )
 
 const (
-	defaultBaseURL        = "https://api.anthropic.com/v1/messages"
-	anthropicVersion      = "2023-06-01"
-	requestTimeout        = 120 * time.Second
-	maxRetries            = 3
+	defaultBaseURL   = "https://api.anthropic.com/v1/messages"
+	anthropicVersion = "2023-06-01"
+	requestTimeout   = 120 * time.Second
+	maxRetries       = 3
 )
 
 // Client is an HTTP client for the Anthropic Messages API.
@@ -58,6 +58,8 @@ func (c *Client) Close() {
 // SendMessage sends a non-streaming request and returns the full response.
 func (c *Client) SendMessage(ctx context.Context, req MessagesRequest) (*MessagesResponse, error) {
 	req.Stream = false
+	beta := req.Beta
+	req.Beta = nil
 	if req.Model == "" {
 		req.Model = c.model
 	}
@@ -69,7 +71,7 @@ func (c *Client) SendMessage(ctx context.Context, req MessagesRequest) (*Message
 
 	var resp *MessagesResponse
 	err = c.withRetry(ctx, func() error {
-		httpResp, err := c.doRequest(ctx, body)
+		httpResp, err := c.doRequest(ctx, body, beta)
 		if err != nil {
 			return err
 		}
@@ -99,6 +101,8 @@ func (c *Client) SendMessage(ctx context.Context, req MessagesRequest) (*Message
 // It returns the reconstructed full response once the stream is complete.
 func (c *Client) StreamMessage(ctx context.Context, req MessagesRequest, onDelta func(text string)) (*MessagesResponse, error) {
 	req.Stream = true
+	beta := req.Beta
+	req.Beta = nil
 	if req.Model == "" {
 		req.Model = c.model
 	}
@@ -110,7 +114,7 @@ func (c *Client) StreamMessage(ctx context.Context, req MessagesRequest, onDelta
 
 	var finalResp *MessagesResponse
 	err = c.withRetry(ctx, func() error {
-		httpResp, err := c.doRequest(ctx, body)
+		httpResp, err := c.doRequest(ctx, body, beta)
 		if err != nil {
 			return err
 		}
@@ -133,7 +137,7 @@ func (c *Client) StreamMessage(ctx context.Context, req MessagesRequest, onDelta
 }
 
 // doRequest builds and executes the HTTP request to the Anthropic API.
-func (c *Client) doRequest(ctx context.Context, body []byte) (*http.Response, error) {
+func (c *Client) doRequest(ctx context.Context, body []byte, beta []string) (*http.Response, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("api: create request: %w", err)
@@ -142,6 +146,9 @@ func (c *Client) doRequest(ctx context.Context, body []byte) (*http.Response, er
 	httpReq.Header.Set("x-api-key", string(c.apiKey))
 	httpReq.Header.Set("anthropic-version", anthropicVersion)
 	httpReq.Header.Set("content-type", "application/json")
+	if len(beta) > 0 {
+		httpReq.Header.Set("anthropic-beta", strings.Join(beta, ","))
+	}
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -155,8 +162,7 @@ func (c *Client) doRequest(ctx context.Context, body []byte) (*http.Response, er
 }
 
 // readStream consumes an SSE stream. It fires onDelta for text deltas and
-// accumulates tool_use blocks (collecting their JSON input from
-// input_json_delta events). Returns the full response when the stream ends.
+// accumulates tool_use and thinking blocks. Returns the full response on completion.
 func (c *Client) readStream(ctx context.Context, r io.Reader, onDelta func(text string)) (*MessagesResponse, error) {
 	type blockState struct {
 		block   ContentBlock
@@ -222,6 +228,8 @@ func (c *Client) readStream(ctx context.Context, r io.Reader, onDelta func(text 
 				}
 			case "input_json_delta":
 				bs.jsonBuf.WriteString(event.Delta.PartialJSON)
+			case "thinking_delta":
+				bs.block.Thinking += event.Delta.Thinking
 			}
 
 		case "content_block_stop":
@@ -313,9 +321,9 @@ func isRetryable(statusCode int) bool {
 
 // APIError wraps an Anthropic API error with its HTTP status code.
 type APIError struct {
-	StatusCode  int
-	ErrorType   string
-	ErrorMsg    string
+	StatusCode int
+	ErrorType  string
+	ErrorMsg   string
 }
 
 func (e *APIError) Error() string {

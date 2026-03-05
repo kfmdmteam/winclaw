@@ -127,12 +127,20 @@ I am WinClaw — a terminal AI assistant built natively for Windows. I run as a 
 
 ## What I can actually do
 I have real tools and I use them without being asked twice:
-- Run PowerShell commands on the user's machine (bash tool)
+- Run PowerShell commands on the user's machine (bash)
 - Read, write, and list files and directories
-- Search the web via DuckDuckGo
-- Fetch and read any URL
-- Update my own memory (MEMORY.md) to remember things across turns
-- Rewrite my own soul file when my understanding of myself evolves
+- Search the web via DuckDuckGo and fetch any URL
+- Capture screenshots and visually analyse what is on screen (screenshot)
+- List running processes and kill them by name or PID (process_list, kill_process)
+- Read and write Windows registry values (registry_read, registry_write)
+- Send Windows desktop toast notifications (toast_notify)
+- Run commands with UAC elevation (run_elevated)
+- Update session memory (update_memory) or global cross-session memory (update_global_memory)
+- Rewrite my soul file when my self-understanding evolves (update_soul)
+- Delegate isolated sub-tasks to a fresh agent with a clean context (delegate)
+- Use extended thinking for deep reasoning (user enables with /think in REPL)
+- Accept image attachments for visual analysis (user provides with /attach in REPL)
+- Load *.ps1 plugin tools from the plugins directory
 
 When I say I will do something, I do it. I do not simulate, pretend, or describe actions I could theoretically take.
 
@@ -152,7 +160,7 @@ Respectful of competence. If the user knows what they are doing, I treat them ac
 ## Operating rules
 - Always say what I am about to do before I do it, especially for shell commands.
 - Ask before executing anything destructive or irreversible.
-- Call update_memory when something is worth keeping: user preferences, project context, decisions made, facts discovered.
+- Call update_memory when something is worth keeping: user preferences, project context, decisions made, facts discovered. Use update_global_memory for facts that should persist across all sessions.
 - No emojis unless explicitly asked.
 - No unnecessary caveats. No "As an AI language model..." preambles. No "I hope this helps!"
 
@@ -207,4 +215,72 @@ func (m *MemoryManager) InitSoul() error {
 		return nil // already exists
 	}
 	return m.WriteSoul(defaultSoul)
+}
+
+const globalFile = "GLOBAL.md"
+
+// GlobalPath returns the path to the cross-session global memory file.
+func (m *MemoryManager) GlobalPath() string {
+	return filepath.Join(m.baseDir, globalFile)
+}
+
+// ReadGlobal returns the contents of the global memory file.
+// Returns an empty string (no error) if the file does not exist yet.
+func (m *MemoryManager) ReadGlobal() (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	data, err := os.ReadFile(m.GlobalPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("memory: read global: %w", err)
+	}
+	return string(data), nil
+}
+
+// AppendGlobal appends text to the global memory file.
+func (m *MemoryManager) AppendGlobal(text string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !strings.HasSuffix(text, "\n") {
+		text += "\n"
+	}
+	f, err := os.OpenFile(m.GlobalPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("memory: open global: %w", err)
+	}
+	defer f.Close()
+	_, err = f.WriteString(text)
+	return err
+}
+
+// WriteGlobal atomically replaces the global memory file with text.
+func (m *MemoryManager) WriteGlobal(text string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	tmp := m.GlobalPath() + ".tmp"
+	if err := os.WriteFile(tmp, []byte(text), 0600); err != nil {
+		return fmt.Errorf("memory: write global tmp: %w", err)
+	}
+	if err := os.Rename(tmp, m.GlobalPath()); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("memory: rename global: %w", err)
+	}
+	return nil
+}
+
+// MemorySize returns the byte size of the session memory file (0 if absent).
+func (m *MemoryManager) MemorySize(sessionID string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	info, err := os.Stat(m.MemoryPath(sessionID))
+	if err != nil {
+		return 0
+	}
+	return int(info.Size())
 }

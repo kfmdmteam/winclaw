@@ -10,6 +10,14 @@ import (
 	"time"
 )
 
+// executePowerShell runs a raw PowerShell script string with the given timeout.
+// Used internally by Windows-native tool functions.
+func executePowerShell(ctx context.Context, script string, timeoutSeconds int) (string, error) {
+	b, _ := json.Marshal(script)
+	raw := json.RawMessage(fmt.Sprintf(`{"command":%s,"timeout_seconds":%d}`, string(b), timeoutSeconds))
+	return executeBash(ctx, raw)
+}
+
 func executeBash(ctx context.Context, input json.RawMessage) (string, error) {
 	var params struct {
 		Command        string `json:"command"`
